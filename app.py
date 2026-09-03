@@ -1749,46 +1749,39 @@ def home():
     return "Лексовский Ботик-Мотик работает!"
 
 
-@app.route(
-    f"/telegram/{WEBHOOK_SECRET}",
-    methods=["POST"]
-)
-def telegram_webhook():
-
+@app.route("/telegram/" + WEBHOOK_SECRET, methods=["POST"])
+async def telegram_webhook():
     try:
+        data = request.get_json(force=True)
 
-        data = request.get_json(
-            force=True
-        )
+        if not data:
+            return "OK", 200
 
         update = Update.de_json(
             data,
             telegram_app.bot
         )
 
-        async def process():
+        await telegram_app.initialize()
 
-            if not telegram_app.initialized:
-                await telegram_app.initialize()
+        try:
+            if update.effective_user:
+                save_user(
+                    update.effective_user,
+                    update.effective_chat.id
+                    if update.effective_chat
+                    else None
+                )
 
-            await telegram_app.process_update(
-                update
-            )
+            await telegram_app.process_update(update)
 
-            if telegram_app.initialized:
-                await telegram_app.shutdown()
+        finally:
+            await telegram_app.shutdown()
 
-        asyncio.run(process())
-
-        return "OK"
+        return "OK", 200
 
     except Exception as e:
-
-        print(
-            "WEBHOOK ERROR:",
-            e
-        )
-
+        print("WEBHOOK ERROR:", repr(e))
         return "ERROR", 500
 
 
