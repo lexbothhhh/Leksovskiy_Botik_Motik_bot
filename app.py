@@ -26,13 +26,9 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-ADMIN_ID_1 = int(os.environ["ADMIN_ID_1"])
-ADMIN_ID_2 = int(os.environ["ADMIN_ID_2"])
+# ТВОЙ Telegram ID — главный администратор
+ADMIN_ID = 7256265881
 
-ADMIN_IDS = {ADMIN_ID_1, ADMIN_ID_2}
-
-# НЕ МЕНЯЕМ БЕЗ НЕОБХОДИМОСТИ:
-# это секрет для webhook, а не название бота
 WEBHOOK_SECRET = "sklad-kustikov-2026-secret-8472"
 
 EXCEL_FILE = "flowers.xlsx"
@@ -52,10 +48,10 @@ telegram_app = (
 # =========================================================
 
 def get_database_url():
-    database_url = os.environ.get("DATABASE_URL")
+    url = os.environ.get("DATABASE_URL")
 
-    if database_url:
-        return database_url
+    if url:
+        return url.strip()
 
     secret_files = [
         "/etc/secrets/DATABASE_URL",
@@ -63,19 +59,24 @@ def get_database_url():
         "/etc/secrets/neon_url",
     ]
 
-    for path in secret_files:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                value = f.read().strip()
+    for filename in secret_files:
+        if os.path.exists(filename):
+            with open(filename, "r", encoding="utf-8") as f:
+                url = f.read().strip()
 
-            if value:
-                return value
+            if url:
+                return url
 
-    raise RuntimeError("DATABASE_URL не найден")
+    raise RuntimeError(
+        "DATABASE_URL не найдена."
+    )
 
 
 def get_db():
-    return psycopg2.connect(get_database_url())
+    return psycopg2.connect(
+        get_database_url(),
+        connect_timeout=10
+    )
 
 
 # =========================================================
@@ -83,14 +84,43 @@ def get_db():
 # =========================================================
 
 def normalize(text):
-    if text is None:
-        return ""
+    return " ".join(
+        str(text)
+        .lower()
+        .replace("ё", "е")
+        .split()
+    )
 
-    text = str(text).strip().lower()
-    text = text.replace("ё", "е")
-    text = re.sub(r"\s+", " ", text)
 
-    return text
+# =========================================================
+# PLAYER / COMMAND STATE
+# =========================================================
+
+PLAYER_ID_RE = re.compile(r"^[A-Za-z0-9]+$")
+
+# Состояния именно команд /at и /add.
+# Ключ = (telegram_user_id, chat_id), поэтому личка и группа
+# никогда не продолжают один и тот же диалог.
+COMMAND_STATES = {}
+
+
+def is_valid_player_id(value):
+    return bool(PLAYER_ID_RE.fullmatch(str(value).strip()))
+
+
+def command_state_key(update):
+    return (
+        update.effective_user.id,
+        update.effective_chat.id
+    )
+
+
+def clear_command_state(update):
+    COMMAND_STATES.pop(command_state_key(update), None)
+
+
+def get_command_state(update):
+    return COMMAND_STATES.get(command_state_key(update))
 
 
 # =========================================================
@@ -98,532 +128,616 @@ def normalize(text):
 # =========================================================
 
 def init_db():
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    # -----------------------------------------------------
-    # FLOWERS
-    # -----------------------------------------------------
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS flowers (
-            id SERIAL PRIMARY KEY,
-            flower TEXT NOT NULL,
-            person TEXT NOT NULL
-        )
-    """)
-
-    cur.execute("""
-        ALTER TABLE flowers
-        ADD COLUMN IF NOT EXISTS flower_id TEXT
-    """)
-
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_flowers_flower
-        ON flowers(flower)
-    """)
-
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_flowers_flower_id
-        ON flowers(flower_id)
-    """)
-
-    # -----------------------------------------------------
-    # PLAYERS
-    # -----------------------------------------------------
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS players (
-            player_id TEXT PRIMARY KEY,
-            nickname TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_players_nickname
-        ON players(nickname)
-    """)
-
-    # -----------------------------------------------------
-    # ADMINS
-    # -----------------------------------------------------
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS bot_admins (
-            telegram_id BIGINT PRIMARY KEY,
-            role TEXT NOT NULL DEFAULT 'admin',
-            added_by BIGINT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # -----------------------------------------------------
-    # USERS
-    # -----------------------------------------------------
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS bot_users (
-            telegram_id BIGINT PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            last_name TEXT,
-            chat_id BIGINT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # -----------------------------------------------------
-    # SETTINGS
-    # -----------------------------------------------------
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS bot_settings (
-            setting_key TEXT PRIMARY KEY,
-            setting_value TEXT NOT NULL
-        )
-    """)
-
-    # -----------------------------------------------------
-    # LOGS
-    # -----------------------------------------------------
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS bot_logs (
-            id SERIAL PRIMARY KEY,
-            admin_id BIGINT,
-            action TEXT,
-            details TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # -----------------------------------------------------
-    # GROUP TRIGGER
-    # -----------------------------------------------------
-
-    cur.execute("""
-        INSERT INTO bot_settings (
-            setting_key,
-            setting_value
-        )
-        VALUES ('group_triggers', 'вжух')
-        ON CONFLICT (setting_key)
-        DO NOTHING
-    """)
-
-    # -----------------------------------------------------
-    # PERMANENT ADMINS
-    # -----------------------------------------------------
-
-    for admin_id in ADMIN_IDS:
-
-        cur.execute("""
-            INSERT INTO bot_admins (
-                telegram_id,
-                role
-            )
-            VALUES (%s, 'admin')
-            ON CONFLICT (telegram_id)
-            DO UPDATE SET role = 'admin'
-        """, (admin_id,))
-
-    # -----------------------------------------------------
-    # MIGRATE OLD FLOWERS -> PLAYERS
-    # -----------------------------------------------------
-
-    cur.execute("""
-        SELECT DISTINCT
-            flower_id,
-            person
-        FROM flowers
-        WHERE flower_id IS NOT NULL
-          AND flower_id <> ''
-    """)
-
-    rows = cur.fetchall()
-
-    for player_id, nickname in rows:
-
-        if not player_id or not nickname:
-            continue
-
-        cur.execute("""
-            INSERT INTO players (
-                player_id,
-                nickname
-            )
-            VALUES (%s, %s)
-            ON CONFLICT (player_id)
-            DO UPDATE SET
-                nickname = EXCLUDED.nickname,
-                updated_at = CURRENT_TIMESTAMP
-        """, (
-            str(player_id).strip(),
-            str(nickname).strip()
-        ))
-
-    conn.commit()
-
-    cur.close()
-    conn.close()
-
-
-# =========================================================
-# EXCEL IMPORT
-# =========================================================
-
-CHECKED_VALUES = {
-    "да",
-    "д",
-    "yes",
-    "y",
-    "1",
-    "true",
-    "истина",
-    "x",
-    "х",
-    "✓",
-    "✔",
-    "☑",
-    "☒",
-    "+"
-}
-
-
-def import_excel():
-
-    if not os.path.exists(EXCEL_FILE):
-        print("Excel файл не найден:", EXCEL_FILE)
-        return
+    db = get_db()
 
     try:
+        with db.cursor() as cursor:
 
-        wb = load_workbook(
-            EXCEL_FILE,
-            data_only=True
-        )
+            # Старая основная таблица
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS flowers (
+                    id SERIAL PRIMARY KEY,
+                    flower TEXT NOT NULL,
+                    person TEXT NOT NULL
+                )
+            """)
 
-        ws = wb.active
+            cursor.execute("""
+                ALTER TABLE flowers
+                ADD COLUMN IF NOT EXISTS flower_id TEXT
+            """)
 
-        headers = [
-            cell.value
-            for cell in ws[1]
-        ]
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_flowers_flower
+                ON flowers(flower)
+            """)
 
-        print("EXCEL HEADERS:", headers)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_flowers_flower_id
+                ON flowers(flower_id)
+            """)
 
-        name_column = None
-        id_column = None
+            # Постоянные игроки: ID не меняется, ник может меняться.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS players (
+                    player_id TEXT PRIMARY KEY,
+                    nickname TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
 
-        for index, header in enumerate(headers):
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_players_nickname
+                ON players(nickname)
+            """)
 
-            if header is None:
-                continue
-
-            normalized = normalize(header)
-
-            if normalized in {
-                "имя",
-                "name",
-                "игровое имя",
-                "ник",
-                "никнейм"
-            }:
-                name_column = index
-
-            if normalized in {
-                "id",
-                "ид",
-                "идентификатор"
-            }:
-                id_column = index
-
-        if name_column is None:
-            print("Не найдена колонка имени")
-            return
-
-        flower_columns = []
-
-        for index, header in enumerate(headers):
-
-            if header is None:
-                continue
-
-            if index in {
-                name_column,
-                id_column
-            }:
-                continue
-
-            flower_columns.append(
-                (index, str(header).strip())
-            )
-
-        conn = get_db()
-        cur = conn.cursor()
-
-        for row in ws.iter_rows(
-            min_row=2,
-            values_only=True
-        ):
-
-            if not row:
-                continue
-
-            person = row[name_column]
-
-            if person is None:
-                continue
-
-            person = str(person).strip()
-
-            if not person:
-                continue
-
-            player_id = None
-
-            if id_column is not None:
-                value = row[id_column]
-
-                if value is not None:
-                    player_id = str(value).strip()
-
-            # ---------------------------------------------
-            # PLAYER
-            # ---------------------------------------------
-
-            if player_id:
-
-                cur.execute("""
-                    INSERT INTO players (
-                        player_id,
-                        nickname
-                    )
-                    VALUES (%s, %s)
-                    ON CONFLICT (player_id)
-                    DO UPDATE SET
-                        nickname = EXCLUDED.nickname,
-                        updated_at = CURRENT_TIMESTAMP
-                """, (
-                    player_id,
+            # Переносим уже существующих игроков из старой таблицы цветов.
+            # Берём последнее имя, если исторически у одного ID их было несколько.
+            cursor.execute("""
+                INSERT INTO players (player_id, nickname)
+                SELECT DISTINCT ON (flower_id)
+                    flower_id,
                     person
-                ))
+                FROM flowers
+                WHERE flower_id IS NOT NULL
+                  AND TRIM(flower_id) <> ''
+                  AND TRIM(person) <> ''
+                ORDER BY flower_id, id DESC
+                ON CONFLICT (player_id) DO NOTHING
+            """)
 
-            # ---------------------------------------------
-            # FLOWERS
-            # ---------------------------------------------
+            # Администраторы
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS bot_admins (
+                    telegram_id BIGINT PRIMARY KEY,
+                    role TEXT NOT NULL DEFAULT 'admin',
+                    added_by BIGINT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
 
-            for column_index, flower_name in flower_columns:
+            # Пользователи, которые писали боту
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS bot_users (
+                    telegram_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    chat_id BIGINT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
 
-                if column_index >= len(row):
-                    continue
+            # Настройки бота
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    setting_key TEXT PRIMARY KEY,
+                    setting_value TEXT NOT NULL
+                )
+            """)
 
-                value = row[column_index]
+            # Журнал действий
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS bot_logs (
+                    id SERIAL PRIMARY KEY,
+                    admin_id BIGINT,
+                    action TEXT,
+                    details TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
 
-                if value is None:
-                    continue
+            # Главный админ
+            cursor.execute("""
+                INSERT INTO bot_admins
+                    (telegram_id, role)
+                VALUES
+                    (%s, 'owner')
+                ON CONFLICT (telegram_id)
+                DO UPDATE SET role = 'owner'
+            """, (ADMIN_ID,))
 
-                checked = normalize(value)
+            # Настройка триггеров группы
+            cursor.execute("""
+                INSERT INTO bot_settings
+                    (setting_key, setting_value)
+                VALUES
+                    ('group_triggers', 'вжух')
+                ON CONFLICT (setting_key)
+                DO NOTHING
+            """)
 
-                if checked not in CHECKED_VALUES:
-                    continue
+        db.commit()
 
-                cur.execute("""
-                    SELECT 1
-                    FROM flowers
-                    WHERE flower = %s
-                      AND person = %s
-                    LIMIT 1
-                """, (
-                    flower_name,
-                    person
-                ))
-
-                exists = cur.fetchone()
-
-                if not exists:
-
-                    cur.execute("""
-                        INSERT INTO flowers (
-                            flower,
-                            person,
-                            flower_id
-                        )
-                        VALUES (%s, %s, %s)
-                    """, (
-                        flower_name,
-                        person,
-                        player_id
-                    ))
-
-        conn.commit()
-
-        cur.close()
-        conn.close()
-
-        print("Excel импорт завершён")
+        print("DATABASE: подключение успешно")
+        print("DATABASE: таблицы готовы")
 
     except Exception as e:
+        db.rollback()
+        print("DATABASE INIT ERROR:", repr(e))
+        raise
 
-        print("ОШИБКА EXCEL:", e)
+    finally:
+        db.close()
+
+
+# =========================================================
+# LOG
+# =========================================================
+
+def log_action(admin_id, action, details=""):
+    db = None
+
+    try:
+        db = get_db()
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO bot_logs
+                    (admin_id, action, details)
+                VALUES
+                    (%s, %s, %s)
+                """,
+                (
+                    admin_id,
+                    action,
+                    details
+                )
+            )
+
+        db.commit()
+
+    except Exception as e:
+        print("LOG ERROR:", repr(e))
+
+    finally:
+        if db:
+            db.close()
 
 
 # =========================================================
 # USERS
 # =========================================================
 
-def save_user(user, chat_id):
+def save_user(user, chat_id=None):
+    if not user:
+        return
 
-    conn = get_db()
-    cur = conn.cursor()
+    db = None
 
-    cur.execute("""
-        INSERT INTO bot_users (
-            telegram_id,
-            username,
-            first_name,
-            last_name,
-            chat_id
-        )
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (telegram_id)
-        DO UPDATE SET
-            username = EXCLUDED.username,
-            first_name = EXCLUDED.first_name,
-            last_name = EXCLUDED.last_name,
-            chat_id = EXCLUDED.chat_id,
-            updated_at = CURRENT_TIMESTAMP
-    """, (
-        user.id,
-        user.username,
-        user.first_name,
-        user.last_name,
-        chat_id
-    ))
+    try:
+        db = get_db()
 
-    conn.commit()
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO bot_users
+                    (
+                        telegram_id,
+                        username,
+                        first_name,
+                        last_name,
+                        chat_id
+                    )
+                VALUES
+                    (%s, %s, %s, %s, %s)
+                ON CONFLICT (telegram_id)
+                DO UPDATE SET
+                    username = EXCLUDED.username,
+                    first_name = EXCLUDED.first_name,
+                    last_name = EXCLUDED.last_name,
+                    chat_id = EXCLUDED.chat_id,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    user.id,
+                    user.username,
+                    user.first_name,
+                    user.last_name,
+                    chat_id
+                )
+            )
 
-    cur.close()
-    conn.close()
+        db.commit()
 
+    except Exception as e:
+        print("SAVE USER ERROR:", repr(e))
 
-# =========================================================
-# ADMINS
-# =========================================================
-
-def is_admin(user_id):
-
-    if user_id in ADMIN_IDS:
-        return True
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT 1
-        FROM bot_admins
-        WHERE telegram_id = %s
-          AND role = 'admin'
-        LIMIT 1
-    """, (user_id,))
-
-    result = cur.fetchone()
-
-    cur.close()
-    conn.close()
-
-    return result is not None
-
-
-def is_owner(user_id):
-
-    return user_id in ADMIN_IDS
+    finally:
+        if db:
+            db.close()
 
 
 # =========================================================
-# LOGGING
+# ADMIN CHECK
 # =========================================================
 
-def log_action(
-    admin_id,
-    action,
-    details=""
-):
+def get_admin_role(telegram_id):
+    db = None
 
-    conn = get_db()
-    cur = conn.cursor()
+    try:
+        db = get_db()
 
-    cur.execute("""
-        INSERT INTO bot_logs (
-            admin_id,
-            action,
-            details
-        )
-        VALUES (%s, %s, %s)
-    """, (
-        admin_id,
-        action,
-        details
-    ))
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT role
+                FROM bot_admins
+                WHERE telegram_id = %s
+                """,
+                (telegram_id,)
+            )
 
-    conn.commit()
+            row = cursor.fetchone()
 
-    cur.close()
-    conn.close()
+            if row:
+                return row[0]
+
+            return None
+
+    except Exception as e:
+        print("ADMIN CHECK ERROR:", repr(e))
+        return None
+
+    finally:
+        if db:
+            db.close()
+
+
+def is_admin(telegram_id):
+    return get_admin_role(telegram_id) in {
+        "owner",
+        "admin"
+    }
+
+
+def is_owner(telegram_id):
+    return get_admin_role(telegram_id) == "owner"
 
 
 # =========================================================
 # SETTINGS
 # =========================================================
 
-def get_setting(key, default=None):
+def get_setting(key, default=""):
+    db = None
 
-    conn = get_db()
-    cur = conn.cursor()
+    try:
+        db = get_db()
 
-    cur.execute("""
-        SELECT setting_value
-        FROM bot_settings
-        WHERE setting_key = %s
-    """, (key,))
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT setting_value
+                FROM bot_settings
+                WHERE setting_key = %s
+                """,
+                (key,)
+            )
 
-    row = cur.fetchone()
+            row = cursor.fetchone()
 
-    cur.close()
-    conn.close()
+            if row:
+                return row[0]
 
-    if row:
-        return row[0]
+            return default
 
-    return default
+    except Exception as e:
+        print("SETTING ERROR:", repr(e))
+        return default
+
+    finally:
+        if db:
+            db.close()
 
 
 def set_setting(key, value):
+    db = None
 
-    conn = get_db()
-    cur = conn.cursor()
+    try:
+        db = get_db()
 
-    cur.execute("""
-        INSERT INTO bot_settings (
-            setting_key,
-            setting_value
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO bot_settings
+                    (setting_key, setting_value)
+                VALUES
+                    (%s, %s)
+                ON CONFLICT (setting_key)
+                DO UPDATE SET
+                    setting_value = EXCLUDED.setting_value
+                """,
+                (
+                    key,
+                    value
+                )
+            )
+
+        db.commit()
+
+    except Exception as e:
+        if db:
+            db.rollback()
+
+        print("SETTING SAVE ERROR:", repr(e))
+
+    finally:
+        if db:
+            db.close()
+
+
+# =========================================================
+# EXCEL
+# =========================================================
+
+def is_checked(value):
+    if value is None:
+        return False
+
+    text = normalize(value)
+
+    checked_values = {
+        "да",
+        "д",
+        "yes",
+        "y",
+        "1",
+        "true",
+        "истина",
+        "x",
+        "х",
+        "✓",
+        "✔",
+        "☑",
+        "☒",
+        "+",
+    }
+
+    return text in checked_values
+
+
+def import_excel():
+    if not os.path.exists(EXCEL_FILE):
+        print(
+            f"EXCEL: файл {EXCEL_FILE} не найден."
         )
-        VALUES (%s, %s)
-        ON CONFLICT (setting_key)
-        DO UPDATE SET
-            setting_value = EXCLUDED.setting_value
-    """, (
-        key,
-        value
-    ))
+        return
 
-    conn.commit()
+    db = None
 
-    cur.close()
-    conn.close()
+    try:
+        workbook = load_workbook(
+            EXCEL_FILE,
+            data_only=True
+        )
+
+        sheet = workbook.active
+
+        rows = list(
+            sheet.iter_rows(
+                values_only=True
+            )
+        )
+
+        if not rows:
+            print("EXCEL: таблица пустая.")
+            return
+
+        headers = []
+
+        for value in rows[0]:
+            if value is None:
+                headers.append("")
+            else:
+                headers.append(
+                    str(value).strip()
+                )
+
+        print(
+            "EXCEL HEADERS:",
+            headers[:20]
+        )
+
+        name_index = None
+        id_index = None
+
+        for index, header in enumerate(headers):
+
+            normalized_header = normalize(header)
+
+            if normalized_header in {
+                "имя",
+                "name",
+                "игровое имя",
+                "ник",
+                "никнейм",
+            }:
+                name_index = index
+
+            if normalized_header in {
+                "id",
+                "ид",
+                "идентификатор",
+            }:
+                id_index = index
+
+        if name_index is None:
+            print(
+                "EXCEL ERROR: "
+                "не найдена колонка Имя."
+            )
+            return
+
+        if id_index is None:
+            print(
+                "EXCEL ERROR: "
+                "не найдена колонка ID."
+            )
+            return
+
+        flower_columns = []
+
+        for index, header in enumerate(headers):
+
+            if index in {
+                name_index,
+                id_index
+            }:
+                continue
+
+            if not header:
+                continue
+
+            flower_columns.append(
+                (index, header)
+            )
+
+        print(
+            "EXCEL: найдено колонок цветов:",
+            len(flower_columns)
+        )
+
+        db = get_db()
+
+        added = 0
+        already_exists = 0
+        skipped = 0
+
+        with db.cursor() as cursor:
+
+            for row in rows[1:]:
+
+                if not row:
+                    continue
+
+                person_value = (
+                    row[name_index]
+                    if name_index < len(row)
+                    else None
+                )
+
+                flower_id_value = (
+                    row[id_index]
+                    if id_index < len(row)
+                    else None
+                )
+
+                if person_value is None:
+                    skipped += 1
+                    continue
+
+                person = str(
+                    person_value
+                ).strip()
+
+                if not person:
+                    skipped += 1
+                    continue
+
+                flower_id = ""
+
+                if flower_id_value is not None:
+                    flower_id = str(
+                        flower_id_value
+                    ).strip()
+
+                # Excel может быть источником старых игроков.
+                # Ник не перезаписываем, если ID уже существует в players.
+                if flower_id and is_valid_player_id(flower_id):
+                    cursor.execute(
+                        """
+                        INSERT INTO players (player_id, nickname)
+                        VALUES (%s, %s)
+                        ON CONFLICT (player_id) DO NOTHING
+                        """,
+                        (flower_id, person)
+                    )
+
+                for column_index, flower_name in flower_columns:
+
+                    value = (
+                        row[column_index]
+                        if column_index < len(row)
+                        else None
+                    )
+
+                    if not is_checked(value):
+                        continue
+
+                    flower = normalize(
+                        flower_name
+                    )
+
+                    if not flower:
+                        continue
+
+                    cursor.execute(
+                        """
+                        SELECT id
+                        FROM flowers
+                        WHERE flower = %s
+                          AND flower_id = %s
+                          AND person = %s
+                        LIMIT 1
+                        """,
+                        (
+                            flower,
+                            flower_id,
+                            person
+                        )
+                    )
+
+                    if cursor.fetchone():
+                        already_exists += 1
+                        continue
+
+                    cursor.execute(
+                        """
+                        INSERT INTO flowers
+                            (
+                                flower,
+                                flower_id,
+                                person
+                            )
+                        VALUES
+                            (%s, %s, %s)
+                        """,
+                        (
+                            flower,
+                            flower_id,
+                            person
+                        )
+                    )
+
+                    added += 1
+
+        db.commit()
+
+        print("EXCEL: импорт завершён.")
+        print("Добавлено:", added)
+        print("Уже было:", already_exists)
+        print("Пропущено строк:", skipped)
+
+    except Exception as e:
+
+        if db:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+        print(
+            "EXCEL IMPORT ERROR:",
+            repr(e)
+        )
+
+    finally:
+
+        if db:
+            db.close()
 
 
 # =========================================================
@@ -631,7 +745,6 @@ def set_setting(key, value):
 # =========================================================
 
 def main_keyboard(user_id):
-
     buttons = [
         [
             InlineKeyboardButton(
@@ -642,7 +755,6 @@ def main_keyboard(user_id):
     ]
 
     if is_admin(user_id):
-
         buttons.append([
             InlineKeyboardButton(
                 "⚙️ Админ-панель",
@@ -653,46 +765,46 @@ def main_keyboard(user_id):
     return InlineKeyboardMarkup(buttons)
 
 
-def admin_keyboard():
-
-    return InlineKeyboardMarkup([
+def admin_keyboard(user_id):
+    buttons = [
         [
             InlineKeyboardButton(
                 "👤 Люди",
-                callback_data="people"
+                callback_data="people_menu"
             ),
             InlineKeyboardButton(
                 "🌸 Цветы",
-                callback_data="flowers"
+                callback_data="flowers_menu"
             )
         ],
         [
             InlineKeyboardButton(
                 "👥 Администраторы",
-                callback_data="admins"
+                callback_data="admins_menu"
             ),
             InlineKeyboardButton(
                 "⚡ Группа",
-                callback_data="group"
+                callback_data="group_menu"
             )
         ],
         [
             InlineKeyboardButton(
                 "📊 Статистика",
-                callback_data="stats"
+                callback_data="statistics"
             )
         ],
         [
             InlineKeyboardButton(
                 "❌ Закрыть",
-                callback_data="close"
+                callback_data="close_menu"
             )
         ]
-    ])
+    ]
+
+    return InlineKeyboardMarkup(buttons)
 
 
 def people_keyboard():
-
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
@@ -703,7 +815,7 @@ def people_keyboard():
         [
             InlineKeyboardButton(
                 "✏️ Изменить ник",
-                callback_data="person_edit"
+                callback_data="person_rename"
             )
         ],
         [
@@ -728,7 +840,6 @@ def people_keyboard():
 
 
 def flowers_keyboard():
-
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
@@ -758,25 +869,6 @@ def flowers_keyboard():
 
 
 # =========================================================
-# COMMAND STATES
-# =========================================================
-
-COMMAND_STATES = {}
-
-PLAYER_ID_RE = re.compile(
-    r"^[A-Za-z0-9]+$"
-)
-
-
-def state_key(user_id, chat_id):
-
-    return (
-        user_id,
-        chat_id
-    )
-
-
-# =========================================================
 # START
 # =========================================================
 
@@ -784,45 +876,20 @@ async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     user = update.effective_user
-    chat = update.effective_chat
 
     save_user(
         user,
-        chat.id
+        update.effective_chat.id
     )
 
+    context.user_data.clear()
+
     await update.message.reply_text(
-        "Лексовский Ботик-Мотик\n\n"
+        "🌸 Лексовский Ботик-Мотик\n\n"
         "Напиши название цветка, чтобы узнать, "
         "у кого он есть.",
         reply_markup=main_keyboard(user.id)
-    )
-
-
-# =========================================================
-# ADMIN
-# =========================================================
-
-async def admin_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user = update.effective_user
-
-    if not is_admin(user.id):
-
-        await update.message.reply_text(
-            "⛔ У тебя нет доступа к админ-панели."
-        )
-
-        return
-
-    await update.message.reply_text(
-        "⚙️ Админ-панель",
-        reply_markup=admin_keyboard()
     )
 
 
@@ -834,7 +901,6 @@ async def show_my_id(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     query = update.callback_query
 
     await query.answer()
@@ -847,737 +913,1654 @@ async def show_my_id(
 
 
 # =========================================================
-# FLOWER SEARCH
+# ADMIN PANEL
 # =========================================================
 
-async def search_flower(
+async def show_admin_panel(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+    query = update.callback_query
 
-    message = update.message
+    await query.answer()
 
-    if not message:
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text(
+            "⛔ Нет доступа."
+        )
         return
 
-    chat = update.effective_chat
+    context.user_data.clear()
 
-    # В группах поиск работает только через триггер
-    if chat.type in {
-        "group",
-        "supergroup"
-    }:
-
-        text = message.text or ""
-
-        triggers_raw = get_setting(
-            "group_triggers",
-            "вжух"
+    await query.message.reply_text(
+        "⚙️ АДМИН-ПАНЕЛЬ\n\n"
+        "Выбери действие:",
+        reply_markup=admin_keyboard(
+            query.from_user.id
         )
+    )
 
-        triggers = [
-            normalize(x)
-            for x in triggers_raw.split(",")
-            if normalize(x)
+
+async def admin_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user = update.effective_user
+
+    save_user(
+        user,
+        update.effective_chat.id
+    )
+
+    if not is_admin(user.id):
+        await update.message.reply_text(
+            "⛔ Нет доступа."
+        )
+        return
+
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "⚙️ АДМИН-ПАНЕЛЬ\n\n"
+        "Выбери действие:",
+        reply_markup=admin_keyboard(user.id)
+    )
+
+
+# =========================================================
+# PEOPLE
+# =========================================================
+
+async def people_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    await query.message.reply_text(
+        "👤 УПРАВЛЕНИЕ ЛЮДЬМИ",
+        reply_markup=people_keyboard()
+    )
+
+
+# =========================================================
+# ADD PERSON
+# =========================================================
+
+async def person_add_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    context.user_data.clear()
+    context.user_data["action"] = "person_add"
+    context.user_data["step"] = "id"
+
+    await query.message.reply_text(
+        "➕ Добавление человека\n\n"
+        "Напиши ID человека:"
+    )
+
+
+# =========================================================
+# RENAME PERSON
+# =========================================================
+
+async def person_rename_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    context.user_data.clear()
+    context.user_data["action"] = "person_rename"
+    context.user_data["step"] = "id"
+
+    await query.message.reply_text(
+        "✏️ Изменение ника\n\n"
+        "Напиши ID человека:"
+    )
+
+
+# =========================================================
+# FIND PERSON
+# =========================================================
+
+async def person_find_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    context.user_data.clear()
+    context.user_data["action"] = "person_find"
+    context.user_data["step"] = "id"
+
+    await query.message.reply_text(
+        "🔎 Напиши ID человека:"
+    )
+
+
+# =========================================================
+# DELETE PERSON
+# =========================================================
+
+async def person_delete_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    context.user_data.clear()
+    context.user_data["action"] = "person_delete"
+    context.user_data["step"] = "id"
+
+    await query.message.reply_text(
+        "🗑 Удаление человека\n\n"
+        "Напиши ID человека.\n\n"
+        "⚠️ Будут удалены ВСЕ записи этого человека."
+    )
+
+
+# =========================================================
+# FLOWER MENU
+# =========================================================
+
+async def flowers_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    await query.message.reply_text(
+        "🌸 УПРАВЛЕНИЕ ЦВЕТАМИ",
+        reply_markup=flowers_keyboard()
+    )
+
+
+# =========================================================
+# ADD FLOWER
+# =========================================================
+
+async def flower_add_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    context.user_data.clear()
+    context.user_data["action"] = "flower_add"
+    context.user_data["step"] = "flower"
+
+    await query.message.reply_text(
+        "➕ Добавление записи\n\n"
+        "Напиши название цветка:"
+    )
+
+
+# =========================================================
+# DELETE FLOWER
+# =========================================================
+
+async def flower_delete_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    context.user_data.clear()
+    context.user_data["action"] = "flower_delete"
+    context.user_data["step"] = "flower"
+
+    await query.message.reply_text(
+        "➖ Удаление записи\n\n"
+        "Напиши название цветка:"
+    )
+
+
+# =========================================================
+# FIND FLOWER
+# =========================================================
+
+async def flower_find_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    context.user_data.clear()
+    context.user_data["action"] = "flower_find"
+    context.user_data["step"] = "flower"
+
+    await query.message.reply_text(
+        "🔎 Напиши название цветка:"
+    )
+
+
+# =========================================================
+# ADMIN MENU
+# =========================================================
+
+async def admins_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_owner(query.from_user.id):
+        await query.message.reply_text(
+            "⛔ Только главный администратор."
+        )
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "➕ Добавить админа",
+                callback_data="admin_add"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📋 Список админов",
+                callback_data="admin_list"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🗑 Удалить админа",
+                callback_data="admin_delete"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "↩️ Назад",
+                callback_data="admin_panel"
+            )
         ]
-
-        text_normalized = normalize(text)
-
-        found_trigger = None
-
-        for trigger in triggers:
-
-            patterns = [
-                trigger,
-                trigger + " ",
-                trigger + ",",
-                trigger + ":",
-                trigger + " —",
-                trigger + " -"
-            ]
-
-            for pattern in patterns:
-
-                if text_normalized.startswith(pattern):
-
-                    found_trigger = trigger
-                    break
-
-            if found_trigger:
-                break
-
-        if not found_trigger:
-            return
-
-        flower = text_normalized[
-            len(found_trigger):
-        ].strip()
-
-        flower = re.sub(
-            r"^[,:—-]\s*",
-            "",
-            flower
-        )
-
-        if not flower:
-            return
-
-    else:
-
-        flower = normalize(
-            message.text
-        )
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT person
-        FROM flowers
-        WHERE LOWER(REPLACE(flower, 'Ё', 'Е'))
-            = LOWER(REPLACE(%s, 'Ё', 'Е'))
-        ORDER BY person
-    """, (
-        flower
-    ))
-
-    rows = cur.fetchall()
-
-    cur.close()
-    conn.close()
-
-    if not rows:
-
-        await message.reply_text(
-            "🌸 Такой цветок не найден."
-        )
-
-        return
-
-    people = [
-        row[0]
-        for row in rows
     ]
 
-    result = (
-        f"🌸 {flower}\n\n"
-        + "\n".join(
-            f"• {person}"
-            for person in people
-        )
-    )
-
-    await message.reply_text(
-        result
+    await query.message.reply_text(
+        "👥 АДМИНИСТРАТОРЫ",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
 # =========================================================
-# DELETE COMMAND
+# ADD ADMIN
 # =========================================================
 
-async def delete_command(
+async def admin_add_start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+    query = update.callback_query
+    await query.answer()
 
-    user = update.effective_user
-
-    if not is_admin(user.id):
-
-        await update.message.reply_text(
-            "⛔ Нет доступа."
-        )
-
+    if not is_owner(query.from_user.id):
         return
 
-    key = state_key(
-        user.id,
-        update.effective_chat.id
-    )
+    context.user_data.clear()
+    context.user_data["action"] = "admin_add"
+    context.user_data["step"] = "id"
 
-    COMMAND_STATES[key] = {
-        "command": "delete"
-    }
-
-    await update.message.reply_text(
-        "🗑 Напиши ID человека, которого нужно удалить.\n\n"
-        "Или /cancel для отмены."
+    await query.message.reply_text(
+        "➕ Добавление администратора\n\n"
+        "Напиши Telegram ID человека.\n\n"
+        "Он может получить свой ID кнопкой "
+        "«🆔 Мой ID»."
     )
 
 
 # =========================================================
-# AT COMMAND
+# DELETE ADMIN
 # =========================================================
 
-async def at_command(
+async def admin_delete_start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+    query = update.callback_query
+    await query.answer()
 
-    user = update.effective_user
-
-    if not is_admin(user.id):
-
-        await update.message.reply_text(
-            "⛔ Нет доступа."
-        )
-
+    if not is_owner(query.from_user.id):
         return
 
-    key = state_key(
-        user.id,
-        update.effective_chat.id
-    )
+    context.user_data.clear()
+    context.user_data["action"] = "admin_delete"
+    context.user_data["step"] = "id"
 
-    COMMAND_STATES[key] = {
-        "command": "at"
-    }
-
-    await update.message.reply_text(
-        "🆔 Напиши ID игрока.\n\n"
-        "Или /cancel для отмены."
+    await query.message.reply_text(
+        "🗑 Удаление администратора\n\n"
+        "Напиши Telegram ID."
     )
 
 
 # =========================================================
-# ADD COMMAND
+# ADMIN LIST
 # =========================================================
 
-async def add_command(
+async def admin_list(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+    query = update.callback_query
+    await query.answer()
 
-    user = update.effective_user
-
-    if not is_admin(user.id):
-
-        await update.message.reply_text(
-            "⛔ Нет доступа."
-        )
-
+    if not is_owner(query.from_user.id):
         return
 
-    key = state_key(
-        user.id,
-        update.effective_chat.id
+    db = None
+
+    try:
+        db = get_db()
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT telegram_id, role
+                FROM bot_admins
+                ORDER BY
+                    CASE
+                        WHEN role = 'owner'
+                        THEN 0
+                        ELSE 1
+                    END,
+                    telegram_id
+                """
+            )
+
+            rows = cursor.fetchall()
+
+    except Exception as e:
+        print("ADMIN LIST ERROR:", repr(e))
+        await query.message.reply_text(
+            "❌ Ошибка базы данных."
+        )
+        return
+
+    finally:
+        if db:
+            db.close()
+
+    if not rows:
+        await query.message.reply_text(
+            "Администраторов нет."
+        )
+        return
+
+    result = "👥 АДМИНИСТРАТОРЫ\n\n"
+
+    for telegram_id, role in rows:
+
+        if role == "owner":
+            title = "👑 Главный админ"
+        else:
+            title = "🛠 Администратор"
+
+        result += (
+            f"{title}\n"
+            f"🆔 {telegram_id}\n\n"
+        )
+
+    await query.message.reply_text(result)
+
+
+# =========================================================
+# GROUP SETTINGS
+# =========================================================
+
+async def group_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    triggers = get_setting(
+        "group_triggers",
+        "вжух"
     )
 
-    COMMAND_STATES[key] = {
-        "command": "add"
-    }
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "⚡ Изменить слова",
+                callback_data="group_triggers_edit"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "↩️ Назад",
+                callback_data="admin_panel"
+            )
+        ]
+    ]
 
-    await update.message.reply_text(
-        "➕ Введи ID и ник через пробел.\n\n"
+    await query.message.reply_text(
+        "⚡ НАСТРОЙКИ ГРУППЫ\n\n"
+        "Сейчас бот реагирует на:\n"
+        f"• {triggers}\n\n"
+        "В группе бот будет молчать на обычные "
+        "сообщения и отвечать только на сообщение "
+        "с одним из этих слов + названием цветка.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def group_triggers_edit(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    context.user_data.clear()
+    context.user_data["action"] = "group_triggers"
+    context.user_data["step"] = "triggers"
+
+    await query.message.reply_text(
+        "⚡ Напиши слова-триггеры через запятую.\n\n"
         "Например:\n"
-        "`ABC123 Лекс`",
-        parse_mode="Markdown"
+        "вжух, нужна, ищу\n\n"
+        "Тогда бот будет реагировать на:\n"
+        "«вжух роза»\n"
+        "«нужна роза»\n"
+        "«ищу розу»"
     )
+
+
+# =========================================================
+# STATISTICS
+# =========================================================
+
+async def statistics(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    db = None
+
+    try:
+        db = get_db()
+
+        with db.cursor() as cursor:
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM flowers"
+            )
+            total_records = cursor.fetchone()[0]
+
+            cursor.execute(
+                """
+                SELECT COUNT(DISTINCT flower_id)
+                FROM flowers
+                WHERE flower_id IS NOT NULL
+                  AND flower_id <> ''
+                """
+            )
+            people = cursor.fetchone()[0]
+
+            cursor.execute(
+                """
+                SELECT COUNT(DISTINCT flower)
+                FROM flowers
+                """
+            )
+            flowers = cursor.fetchone()[0]
+
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM bot_admins
+                """
+            )
+            admins = cursor.fetchone()[0]
+
+    except Exception as e:
+        print("STATISTICS ERROR:", repr(e))
+        await query.message.reply_text(
+            "❌ Ошибка базы данных."
+        )
+        return
+
+    finally:
+        if db:
+            db.close()
+
+    await query.message.reply_text(
+        "📊 СТАТИСТИКА\n\n"
+        f"🌸 Записей о цветах: {total_records}\n"
+        f"👤 Людей по ID: {people}\n"
+        f"🌺 Разных цветов: {flowers}\n"
+        f"🛠 Администраторов: {admins}"
+    )
+
+
+# =========================================================
+# CONFIRM DELETE PERSON
+# =========================================================
+
+def delete_person_confirm_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🗑 ДА, УДАЛИТЬ",
+                callback_data="confirm_person_delete"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "❌ Отмена",
+                callback_data="cancel_action"
+            )
+        ]
+    ])
+
+
+# =========================================================
+# ADMIN TEXT INPUT
+# =========================================================
+
+async def admin_input(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    if not is_admin(user.id):
+        return
+
+    text = update.message.text.strip()
+
+    if not text:
+        return
+
+    # =====================================================
+    # /at и /add: отдельное состояние по user_id + chat_id
+    # =====================================================
+    command_state = get_command_state(update)
+
+    if command_state:
+        command = command_state.get("command")
+        step = command_state.get("step")
+
+        if command == "at":
+            if step == "id":
+                if not is_valid_player_id(text):
+                    await update.message.reply_text(
+                        "❌ ID должен состоять только из латинских букв и цифр.\n\n"
+                        "Пример: s18 или ee15z72gm9u"
+                    )
+                    return
+
+                db = None
+                try:
+                    db = get_db()
+                    with db.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT nickname FROM players WHERE player_id = %s",
+                            (text,)
+                        )
+                        row = cursor.fetchone()
+
+                        if row:
+                            await update.message.reply_text(
+                                f"⚠️ Игрок с ID {text} уже существует.\n"
+                                f"👤 Ник: {row[0]}"
+                            )
+                            clear_command_state(update)
+                            return
+
+                    command_state["player_id"] = text
+                    command_state["step"] = "nickname"
+
+                    await update.message.reply_text(
+                        "Введите ник игрока:"
+                    )
+                except Exception as e:
+                    print("AT ID ERROR:", repr(e))
+                    await update.message.reply_text("❌ Ошибка базы данных.")
+                finally:
+                    if db:
+                        db.close()
+                return
+
+            if step == "nickname":
+                player_id = command_state.get("player_id")
+                nickname = text
+
+                if not player_id:
+                    await update.message.reply_text("❌ Операция устарела. Запусти /at заново.")
+                    clear_command_state(update)
+                    return
+
+                db = None
+                try:
+                    db = get_db()
+                    with db.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            INSERT INTO players (player_id, nickname)
+                            VALUES (%s, %s)
+                            ON CONFLICT (player_id) DO NOTHING
+                            """,
+                            (player_id, nickname)
+                        )
+                        created = cursor.rowcount
+                    db.commit()
+
+                    if not created:
+                        await update.message.reply_text(
+                            f"⚠️ Игрок с ID {player_id} уже существует."
+                        )
+                    else:
+                        log_action(
+                            user.id,
+                            "ADD_PLAYER_COMMAND",
+                            f"{player_id} | {nickname}"
+                        )
+                        await update.message.reply_text(
+                            f"✅ Игрок {player_id} — {nickname} успешно добавлен."
+                        )
+                except Exception as e:
+                    if db:
+                        db.rollback()
+                    print("AT ADD ERROR:", repr(e))
+                    await update.message.reply_text("❌ Ошибка базы данных.")
+                finally:
+                    if db:
+                        db.close()
+
+                clear_command_state(update)
+                return
+
+        if command == "delete":
+            if step == "id":
+                if not is_valid_player_id(text):
+                    await update.message.reply_text(
+                        "❌ ID должен состоять только из латинских букв и цифр."
+                    )
+                    return
+
+                player_id = text
+                db = None
+                try:
+                    db = get_db()
+                    with db.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT nickname FROM players WHERE player_id = %s",
+                            (player_id,)
+                        )
+                        row = cursor.fetchone()
+                        if not row:
+                            await update.message.reply_text(
+                                f"❌ ID {player_id} не найден."
+                            )
+                            clear_command_state(update)
+                            return
+
+                        cursor.execute(
+                            "SELECT COUNT(*) FROM flowers WHERE flower_id = %s",
+                            (player_id,)
+                        )
+                        flower_count = cursor.fetchone()[0]
+
+                    command_state["player_id"] = player_id
+                    command_state["nickname"] = row[0]
+                    command_state["flower_count"] = flower_count
+                    command_state["step"] = "confirm"
+
+                    await update.message.reply_text(
+                        "⚠️ ВНИМАНИЕ\n\n"
+                        f"🆔 ID: {player_id}\n"
+                        f"👤 {row[0]}\n"
+                        f"🌸 Цветов: {flower_count}\n\n"
+                        "Для подтверждения напиши: ДА\n"
+                        "Для отмены: НЕТ"
+                    )
+                except Exception as e:
+                    print("DELETE COMMAND CHECK ERROR:", repr(e))
+                    await update.message.reply_text("❌ Ошибка базы данных.")
+                finally:
+                    if db:
+                        db.close()
+                return
+
+            if step == "confirm":
+                answer = normalize(text)
+                if answer not in {"да", "нет", "д", "н"}:
+                    await update.message.reply_text("Введите ДА для удаления или НЕТ для отмены.")
+                    return
+
+                if answer in {"нет", "н"}:
+                    clear_command_state(update)
+                    await update.message.reply_text("❌ Удаление отменено.")
+                    return
+
+                player_id = command_state.get("player_id")
+                db = None
+                try:
+                    db = get_db()
+                    with db.cursor() as cursor:
+                        cursor.execute("DELETE FROM flowers WHERE flower_id = %s", (player_id,))
+                        deleted_flowers = cursor.rowcount
+                        cursor.execute("DELETE FROM players WHERE player_id = %s", (player_id,))
+                        deleted_player = cursor.rowcount
+                    db.commit()
+
+                    log_action(
+                        user.id,
+                        "DELETE_PERSON_COMMAND",
+                        f"ID {player_id}, player {deleted_player}, records {deleted_flowers}"
+                    )
+
+                    await update.message.reply_text(
+                        "✅ Человек полностью удалён.\n\n"
+                        f"🆔 ID: {player_id}\n"
+                        f"🌸 Удалено записей о цветах: {deleted_flowers}"
+                    )
+                except Exception as e:
+                    if db:
+                        db.rollback()
+                    print("DELETE COMMAND ERROR:", repr(e))
+                    await update.message.reply_text("❌ Ошибка базы данных.")
+                finally:
+                    if db:
+                        db.close()
+
+                clear_command_state(update)
+                return
+
+        if command == "add":
+            if step == "flower":
+                flower = normalize(text)
+                if not flower:
+                    await update.message.reply_text("❌ Название цветка не может быть пустым.")
+                    return
+                command_state["flower"] = flower
+                command_state["step"] = "id"
+                await update.message.reply_text("Введите ID игрока:")
+                return
+
+            if step == "id":
+                if not is_valid_player_id(text):
+                    await update.message.reply_text(
+                        "❌ ID должен состоять только из латинских букв и цифр."
+                    )
+                    return
+
+                flower = command_state.get("flower")
+                db = None
+                try:
+                    db = get_db()
+                    with db.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT nickname FROM players WHERE player_id = %s",
+                            (text,)
+                        )
+                        row = cursor.fetchone()
+
+                        if not row:
+                            await update.message.reply_text(
+                                f"❌ Игрок с ID {text} не найден.\n\n"
+                                "Сначала добавь игрока командой /at."
+                            )
+                            clear_command_state(update)
+                            return
+
+                        nickname = row[0]
+
+                        cursor.execute(
+                            """
+                            SELECT id
+                            FROM flowers
+                            WHERE flower = %s
+                              AND flower_id = %s
+                            LIMIT 1
+                            """,
+                            (flower, text)
+                        )
+                        if cursor.fetchone():
+                            await update.message.reply_text(
+                                "⚠️ Такой цветок уже добавлен этому игроку."
+                            )
+                            clear_command_state(update)
+                            return
+
+                        cursor.execute(
+                            """
+                            INSERT INTO flowers (flower, flower_id, person)
+                            VALUES (%s, %s, %s)
+                            """,
+                            (flower, text, nickname)
+                        )
+
+                    db.commit()
+
+                    log_action(
+                        user.id,
+                        "ADD_FLOWER_COMMAND",
+                        f"{flower} | {text} | {nickname}"
+                    )
+
+                    await update.message.reply_text(
+                        "✅ Цветок успешно добавлен.\n\n"
+                        f"🌸 {flower}\n"
+                        f"🆔 {text}\n"
+                        f"👤 {nickname}"
+                    )
+                except Exception as e:
+                    if db:
+                        db.rollback()
+                    print("ADD COMMAND ERROR:", repr(e))
+                    await update.message.reply_text("❌ Ошибка базы данных.")
+                finally:
+                    if db:
+                        db.close()
+
+                clear_command_state(update)
+                return
+
+        return
+
+    # -----------------------------------------------------
+    # EXISTING ADMIN OPERATIONS FROM BUTTONS
+    # -----------------------------------------------------
+
+    action = context.user_data.get("action")
+    step = context.user_data.get("step")
+
+    if not action or not step:
+        return
+
+    # -----------------------------------------------------
+    # ADD ADMIN
+    # -----------------------------------------------------
+    if action == "admin_add":
+        if not is_owner(user.id):
+            context.user_data.clear()
+            return
+        if step == "id":
+            if not text.isdigit():
+                await update.message.reply_text("❌ ID должен состоять только из цифр.")
+                return
+            telegram_id = int(text)
+            if is_owner(telegram_id):
+                await update.message.reply_text("👑 Это уже главный администратор.")
+                context.user_data.clear()
+                return
+            db = None
+            try:
+                db = get_db()
+                with db.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO bot_admins (telegram_id, role, added_by)
+                        VALUES (%s, 'admin', %s)
+                        ON CONFLICT (telegram_id) DO UPDATE SET role = 'admin'
+                        """,
+                        (telegram_id, user.id)
+                    )
+                db.commit()
+                log_action(user.id, "ADD_ADMIN", str(telegram_id))
+                await update.message.reply_text(
+                    "✅ Администратор добавлен.\n\n"
+                    f"🆔 {telegram_id}"
+                )
+            except Exception as e:
+                if db:
+                    db.rollback()
+                print("ADD ADMIN ERROR:", repr(e))
+                await update.message.reply_text("❌ Ошибка базы данных.")
+            finally:
+                if db:
+                    db.close()
+            context.user_data.clear()
+            return
+
+    # -----------------------------------------------------
+    # DELETE ADMIN
+    # -----------------------------------------------------
+    if action == "admin_delete":
+        if not is_owner(user.id):
+            context.user_data.clear()
+            return
+        if step == "id":
+            if not text.isdigit():
+                await update.message.reply_text("❌ ID должен состоять только из цифр.")
+                return
+            telegram_id = int(text)
+            if telegram_id == ADMIN_ID:
+                await update.message.reply_text("⛔ Главного администратора удалить нельзя.")
+                context.user_data.clear()
+                return
+            db = None
+            try:
+                db = get_db()
+                with db.cursor() as cursor:
+                    cursor.execute(
+                        "DELETE FROM bot_admins WHERE telegram_id = %s AND role <> 'owner'",
+                        (telegram_id,)
+                    )
+                    deleted = cursor.rowcount
+                db.commit()
+                if deleted:
+                    log_action(user.id, "DELETE_ADMIN", str(telegram_id))
+                    await update.message.reply_text("✅ Администратор удалён.")
+                else:
+                    await update.message.reply_text("❌ Такой администратор не найден.")
+            except Exception as e:
+                if db:
+                    db.rollback()
+                print("DELETE ADMIN ERROR:", repr(e))
+                await update.message.reply_text("❌ Ошибка базы данных.")
+            finally:
+                if db:
+                    db.close()
+            context.user_data.clear()
+            return
+
+    # -----------------------------------------------------
+    # GROUP TRIGGERS
+    # -----------------------------------------------------
+    if action == "group_triggers":
+        if step == "triggers":
+            parts = [normalize(x) for x in text.split(",") if normalize(x)]
+            if not parts:
+                await update.message.reply_text("❌ Нужно указать хотя бы одно слово.")
+                return
+            parts = list(dict.fromkeys(parts))
+            value = ", ".join(parts)
+            set_setting("group_triggers", value)
+            log_action(user.id, "CHANGE_TRIGGERS", value)
+            await update.message.reply_text(
+                "✅ Триггеры сохранены.\n\n" + "\n".join(f"⚡ {x}" for x in parts)
+            )
+            context.user_data.clear()
+            return
+
+    # -----------------------------------------------------
+    # FIND PERSON
+    # -----------------------------------------------------
+    if action == "person_find" and step == "id":
+        if not is_valid_player_id(text):
+            await update.message.reply_text("❌ ID должен состоять только из латинских букв и цифр.")
+            return
+        player_id = text
+        db = None
+        try:
+            db = get_db()
+            with db.cursor() as cursor:
+                cursor.execute(
+                    "SELECT nickname FROM players WHERE player_id = %s",
+                    (player_id,)
+                )
+                player = cursor.fetchone()
+                cursor.execute(
+                    """
+                    SELECT flower
+                    FROM flowers
+                    WHERE flower_id = %s
+                    ORDER BY flower
+                    """,
+                    (player_id,)
+                )
+                flowers = cursor.fetchall()
+        except Exception as e:
+            print("PERSON FIND ERROR:", repr(e))
+            await update.message.reply_text("❌ Ошибка базы данных.")
+            context.user_data.clear()
+            return
+        finally:
+            if db:
+                db.close()
+
+        if not player:
+            await update.message.reply_text(f"❌ ID {player_id} не найден.")
+            context.user_data.clear()
+            return
+
+        result = f"🆔 ID: {player_id}\n\n👤 {player[0]}\n\n🌸 Цветы:\n"
+        if flowers:
+            result += "\n".join(f"• {row[0]}" for row in flowers)
+        else:
+            result += "• Цветов нет"
+        await update.message.reply_text(result)
+        context.user_data.clear()
+        return
+
+    # -----------------------------------------------------
+    # DELETE PERSON
+    # -----------------------------------------------------
+    if action == "person_delete" and step == "id":
+        if not is_valid_player_id(text):
+            await update.message.reply_text("❌ ID должен состоять только из латинских букв и цифр.")
+            return
+        player_id = text
+        db = None
+        try:
+            db = get_db()
+            with db.cursor() as cursor:
+                cursor.execute(
+                    "SELECT nickname FROM players WHERE player_id = %s",
+                    (player_id,)
+                )
+                player = cursor.fetchone()
+                if not player:
+                    await update.message.reply_text(f"❌ ID {player_id} не найден.")
+                    context.user_data.clear()
+                    return
+                cursor.execute(
+                    "SELECT COUNT(*) FROM flowers WHERE flower_id = %s",
+                    (player_id,)
+                )
+                flower_count = cursor.fetchone()[0]
+        except Exception as e:
+            print("PERSON DELETE CHECK ERROR:", repr(e))
+            await update.message.reply_text("❌ Ошибка базы данных.")
+            context.user_data.clear()
+            return
+        finally:
+            if db:
+                db.close()
+
+        context.user_data["delete_id"] = player_id
+        await update.message.reply_text(
+            "⚠️ ВНИМАНИЕ\n\n"
+            f"ID: {player_id}\n"
+            f"👤 {player[0]}\n"
+            f"🌸 Цветов: {flower_count}\n\n"
+            "Будут удалены игрок и ВСЕ его записи о цветах.\n"
+            "Это действие нельзя отменить.",
+            reply_markup=delete_person_confirm_keyboard()
+        )
+        return
+
+    # -----------------------------------------------------
+    # RENAME PERSON
+    # -----------------------------------------------------
+    if action == "person_rename":
+        if step == "id":
+            if not is_valid_player_id(text):
+                await update.message.reply_text("❌ ID должен состоять только из латинских букв и цифр.")
+                return
+            db = None
+            try:
+                db = get_db()
+                with db.cursor() as cursor:
+                    cursor.execute("SELECT nickname FROM players WHERE player_id = %s", (text,))
+                    row = cursor.fetchone()
+                if not row:
+                    await update.message.reply_text("❌ Такой ID не найден.")
+                    context.user_data.clear()
+                    return
+            except Exception as e:
+                print("RENAME CHECK ERROR:", repr(e))
+                await update.message.reply_text("❌ Ошибка базы данных.")
+                context.user_data.clear()
+                return
+            finally:
+                if db:
+                    db.close()
+            context.user_data["rename_id"] = text
+            context.user_data["step"] = "name"
+            await update.message.reply_text("✏️ Теперь напиши новое игровое имя:")
+            return
+
+        if step == "name":
+            player_id = context.user_data["rename_id"]
+            new_name = text
+            db = None
+            try:
+                db = get_db()
+                with db.cursor() as cursor:
+                    cursor.execute("SELECT nickname FROM players WHERE player_id = %s", (player_id,))
+                    row = cursor.fetchone()
+                    if not row:
+                        await update.message.reply_text("❌ Такой ID не найден.")
+                        context.user_data.clear()
+                        return
+                    old_name = row[0]
+                    cursor.execute(
+                        """
+                        UPDATE players
+                        SET nickname = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE player_id = %s
+                        """,
+                        (new_name, player_id)
+                    )
+                    # Сохраняем старое поле person совместимым со старой системой.
+                    cursor.execute(
+                        "UPDATE flowers SET person = %s WHERE flower_id = %s",
+                        (new_name, player_id)
+                    )
+                    changed = cursor.rowcount
+                db.commit()
+                log_action(user.id, "RENAME_PERSON", f"{player_id}: {old_name} -> {new_name}")
+                await update.message.reply_text(
+                    "✅ Имя изменено.\n\n"
+                    f"🆔 ID: {player_id}\n"
+                    f"Было: {old_name}\n"
+                    f"Стало: {new_name}\n\n"
+                    f"Цветочных записей обновлено: {changed}"
+                )
+            except Exception as e:
+                if db:
+                    db.rollback()
+                print("RENAME ERROR:", repr(e))
+                await update.message.reply_text("❌ Ошибка базы данных.")
+            finally:
+                if db:
+                    db.close()
+            context.user_data.clear()
+            return
+
+    # -----------------------------------------------------
+    # ADD PERSON FROM EXISTING BUTTON
+    # -----------------------------------------------------
+    if action == "person_add":
+        if step == "id":
+            if not is_valid_player_id(text):
+                await update.message.reply_text("❌ ID должен состоять только из латинских букв и цифр.")
+                return
+            db = None
+            try:
+                db = get_db()
+                with db.cursor() as cursor:
+                    cursor.execute("SELECT nickname FROM players WHERE player_id = %s", (text,))
+                    if cursor.fetchone():
+                        await update.message.reply_text("⚠️ Игрок с таким ID уже существует.")
+                        context.user_data.clear()
+                        return
+            except Exception as e:
+                print("ADD PERSON CHECK ERROR:", repr(e))
+                await update.message.reply_text("❌ Ошибка базы данных.")
+                context.user_data.clear()
+                return
+            finally:
+                if db:
+                    db.close()
+            context.user_data["new_id"] = text
+            context.user_data["step"] = "name"
+            await update.message.reply_text("Теперь напиши игровое имя:")
+            return
+
+        if step == "name":
+            context.user_data["new_person"] = text
+            context.user_data["step"] = "flower"
+            await update.message.reply_text("Теперь напиши название цветка:")
+            return
+
+        if step == "flower":
+            flower = normalize(text)
+            player_id = context.user_data["new_id"]
+            person = context.user_data["new_person"]
+            db = None
+            try:
+                db = get_db()
+                with db.cursor() as cursor:
+                    cursor.execute(
+                        "INSERT INTO players (player_id, nickname) VALUES (%s, %s)",
+                        (player_id, person)
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO flowers (flower, flower_id, person)
+                        VALUES (%s, %s, %s)
+                        """,
+                        (flower, player_id, person)
+                    )
+                db.commit()
+                log_action(user.id, "ADD_PERSON_FLOWER", f"{player_id} | {person} | {flower}")
+                await update.message.reply_text(
+                    "✅ Добавлено:\n\n"
+                    f"🆔 {player_id}\n👤 {person}\n🌸 {flower}"
+                )
+            except Exception as e:
+                if db:
+                    db.rollback()
+                print("ADD PERSON ERROR:", repr(e))
+                await update.message.reply_text("❌ Ошибка базы данных.")
+            finally:
+                if db:
+                    db.close()
+            context.user_data.clear()
+            return
+
+    # -----------------------------------------------------
+    # ADD FLOWER FROM EXISTING BUTTON
+    # -----------------------------------------------------
+    if action == "flower_add":
+        if step == "flower":
+            flower = normalize(text)
+            if not flower:
+                await update.message.reply_text("❌ Название цветка не может быть пустым.")
+                return
+            context.user_data["flower"] = flower
+            context.user_data["step"] = "id"
+            await update.message.reply_text("Теперь напиши ID игрока:")
+            return
+
+        if step == "id":
+            if not is_valid_player_id(text):
+                await update.message.reply_text("❌ ID должен состоять только из латинских букв и цифр.")
+                return
+            flower = context.user_data["flower"]
+            db = None
+            try:
+                db = get_db()
+                with db.cursor() as cursor:
+                    cursor.execute("SELECT nickname FROM players WHERE player_id = %s", (text,))
+                    row = cursor.fetchone()
+                    if not row:
+                        await update.message.reply_text(
+                            f"❌ Игрок с ID {text} не найден.\n\nСначала добавь игрока через /at."
+                        )
+                        context.user_data.clear()
+                        return
+                    nickname = row[0]
+                    cursor.execute(
+                        "SELECT id FROM flowers WHERE flower = %s AND flower_id = %s LIMIT 1",
+                        (flower, text)
+                    )
+                    if cursor.fetchone():
+                        await update.message.reply_text("⚠️ Такой цветок уже добавлен этому игроку.")
+                        context.user_data.clear()
+                        return
+                    cursor.execute(
+                        "INSERT INTO flowers (flower, flower_id, person) VALUES (%s, %s, %s)",
+                        (flower, text, nickname)
+                    )
+                db.commit()
+                log_action(user.id, "ADD_FLOWER", f"{flower} | {text} | {nickname}")
+                await update.message.reply_text(
+                    "✅ Добавлено:\n\n"
+                    f"🌸 {flower}\n🆔 {text}\n👤 {nickname}"
+                )
+            except Exception as e:
+                if db:
+                    db.rollback()
+                print("ADD FLOWER ERROR:", repr(e))
+                await update.message.reply_text("❌ Ошибка базы данных.")
+            finally:
+                if db:
+                    db.close()
+            context.user_data.clear()
+            return
+
+    # -----------------------------------------------------
+    # DELETE FLOWER FROM EXISTING BUTTON
+    # -----------------------------------------------------
+    if action == "flower_delete":
+        if step == "flower":
+            context.user_data["flower"] = normalize(text)
+            context.user_data["step"] = "id"
+            await update.message.reply_text("Теперь напиши ID игрока:")
+            return
+
+        if step == "id":
+            if not is_valid_player_id(text):
+                await update.message.reply_text("❌ ID должен состоять только из латинских букв и цифр.")
+                return
+            flower = context.user_data["flower"]
+            db = None
+            try:
+                db = get_db()
+                with db.cursor() as cursor:
+                    cursor.execute(
+                        "DELETE FROM flowers WHERE flower = %s AND flower_id = %s",
+                        (flower, text)
+                    )
+                    deleted = cursor.rowcount
+                    cursor.execute("SELECT nickname FROM players WHERE player_id = %s", (text,))
+                    row = cursor.fetchone()
+                    nickname = row[0] if row else ""
+                db.commit()
+                if deleted:
+                    log_action(user.id, "DELETE_FLOWER", f"{flower} | {text} | {nickname}")
+                    await update.message.reply_text(
+                        "✅ Удалено:\n\n"
+                        f"🌸 {flower}\n🆔 {text}\n👤 {nickname}"
+                    )
+                else:
+                    await update.message.reply_text("❌ Такая запись не найдена.")
+            except Exception as e:
+                if db:
+                    db.rollback()
+                print("DELETE FLOWER ERROR:", repr(e))
+                await update.message.reply_text("❌ Ошибка базы данных.")
+            finally:
+                if db:
+                    db.close()
+            context.user_data.clear()
+            return
+
+    # -----------------------------------------------------
+    # FIND FLOWER
+    # -----------------------------------------------------
+    if action == "flower_find" and step == "flower":
+        flower = normalize(text)
+        db = None
+        try:
+            db = get_db()
+            with db.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT f.flower_id, COALESCE(p.nickname, f.person)
+                    FROM flowers f
+                    LEFT JOIN players p ON p.player_id = f.flower_id
+                    WHERE f.flower = %s
+                    ORDER BY COALESCE(p.nickname, f.person)
+                    """,
+                    (flower,)
+                )
+                rows = cursor.fetchall()
+        except Exception as e:
+            print("FLOWER FIND ERROR:", repr(e))
+            await update.message.reply_text("❌ Ошибка базы данных.")
+            context.user_data.clear()
+            return
+        finally:
+            if db:
+                db.close()
+        if not rows:
+            await update.message.reply_text(f"❌ Не нашёл «{text}».")
+            context.user_data.clear()
+            return
+        result = f"🌸 {text}\n\nЕсть у:\n"
+        for flower_id, person in rows:
+            result += f"🆔 {flower_id or 'ID не указан'} — 👤 {person}\n"
+        await update.message.reply_text(result)
+        context.user_data.clear()
+        return
+
+
+# =========================================================
+# CONFIRM DELETE PERSON
+# =========================================================
+
+async def confirm_person_delete(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    player_id = context.user_data.get("delete_id")
+
+    if not player_id:
+        await query.message.reply_text("❌ Операция устарела.")
+        context.user_data.clear()
+        return
+
+    db = None
+    try:
+        db = get_db()
+        with db.cursor() as cursor:
+            cursor.execute("DELETE FROM flowers WHERE flower_id = %s", (player_id,))
+            deleted_flowers = cursor.rowcount
+            cursor.execute("DELETE FROM players WHERE player_id = %s", (player_id,))
+            deleted_player = cursor.rowcount
+        db.commit()
+
+        log_action(
+            query.from_user.id,
+            "DELETE_PERSON",
+            f"ID {player_id}, player {deleted_player}, records {deleted_flowers}"
+        )
+
+        await query.message.reply_text(
+            "✅ Человек полностью удалён.\n\n"
+            f"🆔 ID: {player_id}\n"
+            f"🌸 Удалено записей о цветах: {deleted_flowers}"
+        )
+    except Exception as e:
+        if db:
+            db.rollback()
+        print("DELETE PERSON ERROR:", repr(e))
+        await query.message.reply_text("❌ Ошибка базы данных.")
+    finally:
+        if db:
+            db.close()
+
+    context.user_data.clear()
 
 
 # =========================================================
 # CANCEL
 # =========================================================
 
-async def cancel_command(
+async def cancel_action(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+    query = update.callback_query
 
-    key = state_key(
-        update.effective_user.id,
-        update.effective_chat.id
+    await query.answer(
+        "Отменено"
     )
 
-    COMMAND_STATES.pop(
-        key,
-        None
-    )
-
-    await update.message.reply_text(
-        "❌ Действие отменено."
-    )
-
-
-# =========================================================
-# TEXT HANDLER
-# =========================================================
-
-async def text_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = update.message
-
-    if not message:
-        return
-
-    user = update.effective_user
-    chat = update.effective_chat
-
-    save_user(
-        user,
-        chat.id
-    )
-
-    key = state_key(
-        user.id,
-        chat.id
-    )
-
-    text = message.text or ""
-
-    # -----------------------------------------------------
-    # COMMAND STATE
-    # -----------------------------------------------------
-
-    if key in COMMAND_STATES:
-
-        state = COMMAND_STATES[key]
-
-        command = state.get(
-            "command"
-        )
-
-        # ---------------------------------------------
-        # ADD
-        # ---------------------------------------------
-
-        if command == "add":
-
-            if not is_admin(user.id):
-                COMMAND_STATES.pop(key, None)
-                return
-
-            parts = text.strip().split(
-                maxsplit=1
-            )
-
-            if len(parts) != 2:
-
-                await message.reply_text(
-                    "❌ Формат:\n"
-                    "`ID Ник`",
-                    parse_mode="Markdown"
-                )
-
-                return
-
-            player_id = parts[0].strip()
-            nickname = parts[1].strip()
-
-            if not PLAYER_ID_RE.match(
-                player_id
-            ):
-
-                await message.reply_text(
-                    "❌ ID должен содержать "
-                    "только латинские буквы и цифры."
-                )
-
-                return
-
-            conn = get_db()
-            cur = conn.cursor()
-
-            cur.execute("""
-                INSERT INTO players (
-                    player_id,
-                    nickname
-                )
-                VALUES (%s, %s)
-                ON CONFLICT (player_id)
-                DO UPDATE SET
-                    nickname = EXCLUDED.nickname,
-                    updated_at = CURRENT_TIMESTAMP
-            """, (
-                player_id,
-                nickname
-            ))
-
-            conn.commit()
-
-            cur.close()
-            conn.close()
-
-            COMMAND_STATES.pop(
-                key,
-                None
-            )
-
-            log_action(
-                user.id,
-                "add_player",
-                f"{player_id} {nickname}"
-            )
-
-            await message.reply_text(
-                f"✅ Человек добавлен.\n\n"
-                f"🆔 ID: {player_id}\n"
-                f"👤 Ник: {nickname}"
-            )
-
-            return
-
-        # ---------------------------------------------
-        # AT
-        # ---------------------------------------------
-
-        if command == "at":
-
-            player_id = text.strip()
-
-            conn = get_db()
-            cur = conn.cursor()
-
-            cur.execute("""
-                SELECT nickname
-                FROM players
-                WHERE player_id = %s
-            """, (
-                player_id
-            ))
-
-            row = cur.fetchone()
-
-            cur.close()
-            conn.close()
-
-            COMMAND_STATES.pop(
-                key,
-                None
-            )
-
-            if not row:
-
-                await message.reply_text(
-                    "❌ Игрок с таким ID не найден."
-                )
-
-                return
-
-            await message.reply_text(
-                f"👤 {row[0]}\n"
-                f"🆔 {player_id}"
-            )
-
-            return
-
-        # ---------------------------------------------
-        # DELETE
-        # ---------------------------------------------
-
-        if command == "delete":
-
-            player_id = text.strip()
-
-            conn = get_db()
-            cur = conn.cursor()
-
-            cur.execute("""
-                SELECT nickname
-                FROM players
-                WHERE player_id = %s
-            """, (
-                player_id
-            ))
-
-            row = cur.fetchone()
-
-            if not row:
-
-                cur.close()
-                conn.close()
-
-                COMMAND_STATES.pop(
-                    key,
-                    None
-                )
-
-                await message.reply_text(
-                    "❌ Игрок не найден."
-                )
-
-                return
-
-            nickname = row[0]
-
-            cur.execute("""
-                DELETE FROM players
-                WHERE player_id = %s
-            """, (
-                player_id
-            ))
-
-            cur.execute("""
-                DELETE FROM flowers
-                WHERE flower_id = %s
-            """, (
-                player_id
-            ))
-
-            conn.commit()
-
-            cur.close()
-            conn.close()
-
-            COMMAND_STATES.pop(
-                key,
-                None
-            )
-
-            log_action(
-                user.id,
-                "delete_player",
-                f"{player_id} {nickname}"
-            )
-
-            await message.reply_text(
-                f"🗑 Удалён:\n"
-                f"👤 {nickname}\n"
-                f"🆔 {player_id}"
-            )
-
-            return
-
-    # -----------------------------------------------------
-    # GROUP
-    # -----------------------------------------------------
-
-    if chat.type in {
-        "group",
-        "supergroup"
-    }:
-
-        await search_flower(
-            update,
-            context
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # PRIVATE
-    # -----------------------------------------------------
-
-    await search_flower(
-        update,
-        context
+    context.user_data.clear()
+    clear_command_state(update)
+
+    await query.message.reply_text(
+        "❌ Операция отменена."
     )
 
 
 # =========================================================
-# CALLBACKS
+# GENERAL CALLBACKS
 # =========================================================
 
 async def callback_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     query = update.callback_query
-
-    await query.answer()
-
-    user_id = query.from_user.id
 
     data = query.data
 
-    # -----------------------------------------------------
-    # MY ID
-    # -----------------------------------------------------
-
     if data == "my_id":
-
-        await query.message.reply_text(
-            f"🆔 Твой Telegram ID:\n\n"
-            f"`{user_id}`",
-            parse_mode="Markdown"
+        await show_my_id(
+            update,
+            context
         )
-
         return
-
-    # -----------------------------------------------------
-    # ADMIN PANEL
-    # -----------------------------------------------------
 
     if data == "admin_panel":
-
-        if not is_admin(user_id):
-            return
-
-        await query.message.reply_text(
-            "⚙️ Админ-панель",
-            reply_markup=admin_keyboard()
+        await show_admin_panel(
+            update,
+            context
         )
-
         return
 
-    # -----------------------------------------------------
-    # PEOPLE
-    # -----------------------------------------------------
-
-    if data == "people":
-
-        if not is_admin(user_id):
-            return
-
-        await query.message.reply_text(
-            "👤 Люди",
-            reply_markup=people_keyboard()
+    if data == "people_menu":
+        await people_menu(
+            update,
+            context
         )
-
         return
 
-    # -----------------------------------------------------
-    # FLOWERS
-    # -----------------------------------------------------
-
-    if data == "flowers":
-
-        if not is_admin(user_id):
-            return
-
-        await query.message.reply_text(
-            "🌸 Цветы",
-            reply_markup=flowers_keyboard()
+    if data == "person_add":
+        await person_add_start(
+            update,
+            context
         )
-
         return
 
-    # -----------------------------------------------------
-    # ADMINS
-    # -----------------------------------------------------
-
-    if data == "admins":
-
-        if not is_owner(user_id):
-
-            await query.message.reply_text(
-                "⛔ Управлять администраторами "
-                "могут только два главных администратора."
-            )
-
-            return
-
-        conn = get_db()
-        cur = conn.cursor()
-
-        cur.execute("""
-            SELECT telegram_id, role
-            FROM bot_admins
-            ORDER BY telegram_id
-        """)
-
-        rows = cur.fetchall()
-
-        cur.close()
-        conn.close()
-
-        if not rows:
-
-            text = "👥 Администраторов нет."
-
-        else:
-
-            text = "👥 Администраторы:\n\n"
-
-            for telegram_id, role in rows:
-
-                permanent = (
-                    " ⭐"
-                    if telegram_id in ADMIN_IDS
-                    else ""
-                )
-
-                text += (
-                    f"• `{telegram_id}` — "
-                    f"{role}{permanent}\n"
-                )
-
-        await query.message.reply_text(
-            text,
-            parse_mode="Markdown"
+    if data == "person_rename":
+        await person_rename_start(
+            update,
+            context
         )
-
         return
 
-    # -----------------------------------------------------
-    # GROUP
-    # -----------------------------------------------------
-
-    if data == "group":
-
-        if not is_admin(user_id):
-            return
-
-        triggers = get_setting(
-            "group_triggers",
-            "вжух"
+    if data == "person_find":
+        await person_find_start(
+            update,
+            context
         )
-
-        await query.message.reply_text(
-            "⚡ Триггеры группы:\n\n"
-            f"`{triggers}`\n\n"
-            "Бот реагирует только если сообщение "
-            "начинается с точного триггера.",
-            parse_mode="Markdown"
-        )
-
         return
 
-    # -----------------------------------------------------
-    # STATS
-    # -----------------------------------------------------
-
-    if data == "stats":
-
-        if not is_admin(user_id):
-            return
-
-        conn = get_db()
-        cur = conn.cursor()
-
-        cur.execute("""
-            SELECT COUNT(*)
-            FROM players
-        """)
-
-        players_count = cur.fetchone()[0]
-
-        cur.execute("""
-            SELECT COUNT(*)
-            FROM flowers
-        """)
-
-        flowers_count = cur.fetchone()[0]
-
-        cur.execute("""
-            SELECT COUNT(DISTINCT flower)
-            FROM flowers
-        """)
-
-        unique_flowers = cur.fetchone()[0]
-
-        cur.close()
-        conn.close()
-
-        await query.message.reply_text(
-            "📊 Статистика\n\n"
-            f"👤 Людей: {players_count}\n"
-            f"🌸 Записей цветов: {flowers_count}\n"
-            f"🌺 Уникальных цветов: {unique_flowers}"
+    if data == "person_delete":
+        await person_delete_start(
+            update,
+            context
         )
-
         return
 
-    # -----------------------------------------------------
-    # CLOSE
-    # -----------------------------------------------------
+    if data == "flowers_menu":
+        await flowers_menu(
+            update,
+            context
+        )
+        return
 
-    if data == "close":
+    if data == "flower_add":
+        await flower_add_start(
+            update,
+            context
+        )
+        return
+
+    if data == "flower_delete":
+        await flower_delete_start(
+            update,
+            context
+        )
+        return
+
+    if data == "flower_find":
+        await flower_find_start(
+            update,
+            context
+        )
+        return
+
+    if data == "admins_menu":
+        await admins_menu(
+            update,
+            context
+        )
+        return
+
+    if data == "admin_add":
+        await admin_add_start(
+            update,
+            context
+        )
+        return
+
+    if data == "admin_delete":
+        await admin_delete_start(
+            update,
+            context
+        )
+        return
+
+    if data == "admin_list":
+        await admin_list(
+            update,
+            context
+        )
+        return
+
+    if data == "group_menu":
+        await group_menu(
+            update,
+            context
+        )
+        return
+
+    if data == "group_triggers_edit":
+        await group_triggers_edit(
+            update,
+            context
+        )
+        return
+
+    if data == "statistics":
+        await statistics(
+            update,
+            context
+        )
+        return
+
+    if data == "confirm_person_delete":
+        await confirm_person_delete(
+            update,
+            context
+        )
+        return
+
+    if data == "cancel_action":
+        await cancel_action(
+            update,
+            context
+        )
+        return
+
+    if data == "close_menu":
+
+        await query.answer(
+            "Меню закрыто"
+        )
+
+        context.user_data.clear()
 
         try:
             await query.message.delete()
@@ -1586,94 +2569,353 @@ async def callback_handler(
 
         return
 
-    # -----------------------------------------------------
-    # PERSON ADD
-    # -----------------------------------------------------
+    await query.answer()
 
-    if data == "person_add":
 
-        if not is_admin(user_id):
+# =========================================================
+# NORMAL PRIVATE SEARCH
+# =========================================================
+
+async def search_flower(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user = update.effective_user
+
+    if not user:
+        return
+
+    # В группе обычные сообщения полностью игнорируем.
+    if update.effective_chat.type in {
+        "group",
+        "supergroup"
+    }:
+        return
+
+    if is_admin(user.id):
+        if context.user_data.get("action"):
             return
 
-        key = state_key(
-            user_id,
-            query.message.chat_id
+    text = update.message.text.strip()
+
+    if not text or text.startswith("/"):
+        return
+
+    flower = normalize(text)
+
+    db = None
+
+    try:
+
+        db = get_db()
+
+        with db.cursor() as cursor:
+
+            cursor.execute(
+                """
+                SELECT f.flower_id, COALESCE(p.nickname, f.person)
+                FROM flowers f
+                LEFT JOIN players p ON p.player_id = f.flower_id
+                WHERE f.flower = %s
+                ORDER BY COALESCE(p.nickname, f.person)
+                """,
+                (flower,)
+            )
+
+            rows = cursor.fetchall()
+
+    except Exception as e:
+
+        print(
+            "DATABASE SEARCH ERROR:",
+            repr(e)
         )
 
+        await update.message.reply_text(
+            "❌ Ошибка при обращении к базе данных."
+        )
+
+        return
+
+    finally:
+
+        if db:
+            db.close()
+
+    if not rows:
+
+        await update.message.reply_text(
+            f"❌ Не нашёл «{text}»."
+        )
+
+        return
+
+    result = (
+        f"🌸 {text}\n\n"
+        "Есть у:\n"
+    )
+
+    for flower_id, person in rows:
+
+        if flower_id:
+
+            result += (
+                f"🆔 {flower_id} — "
+                f"👤 {person}\n"
+            )
+
+        else:
+
+            result += (
+                f"🆔 ID не указан — "
+                f"👤 {person}\n"
+            )
+
+    await update.message.reply_text(
+        result
+    )
+
+
+# =========================================================
+# GROUP TRIGGER
+# =========================================================
+
+async def group_trigger(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not update.message:
+        return
+
+    if update.effective_chat.type not in {
+        "group",
+        "supergroup"
+    }:
+        return
+
+    text = update.message.text
+
+    if not text:
+        return
+
+    original = text.strip()
+    normalized = normalize(original)
+
+    triggers_raw = get_setting(
+        "group_triggers",
+        "вжух"
+    )
+
+    triggers = [
+        normalize(x)
+        for x in triggers_raw.split(",")
+        if normalize(x)
+    ]
+
+    matched_trigger = None
+    flower_query = ""
+
+    # Поддерживаем:
+    # вжух роза
+    # вжух, роза
+    # вжух: роза
+    # вжух — роза
+
+    for trigger in triggers:
+
+        pattern = (
+            r"^"
+            + re.escape(trigger)
+            + r"(?:\s*[,:\-—]\s*|\s+)"
+            + r"(.+)$"
+        )
+
+        match = re.match(
+            pattern,
+            normalized,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+
+            matched_trigger = trigger
+            flower_query = match.group(1).strip()
+
+            break
+
+    if not matched_trigger:
+        return
+
+    if not flower_query:
+        return
+
+    db = None
+
+    try:
+
+        db = get_db()
+
+        with db.cursor() as cursor:
+
+            cursor.execute(
+                """
+                SELECT f.flower_id, COALESCE(p.nickname, f.person)
+                FROM flowers f
+                LEFT JOIN players p ON p.player_id = f.flower_id
+                WHERE f.flower = %s
+                ORDER BY COALESCE(p.nickname, f.person)
+                """,
+                (flower_query,)
+            )
+
+            rows = cursor.fetchall()
+
+    except Exception as e:
+
+        print(
+            "GROUP SEARCH ERROR:",
+            repr(e)
+        )
+
+        return
+
+    finally:
+
+        if db:
+            db.close()
+
+    if not rows:
+
+        await update.message.reply_text(
+            f"❌ Не нашёл «{flower_query}»."
+        )
+
+        return
+
+    result = (
+        f"🌸 {flower_query}\n\n"
+        "Есть у:\n"
+    )
+
+    for flower_id, person in rows:
+
+        if flower_id:
+
+            result += (
+                f"🆔 {flower_id} — "
+                f"👤 {person}\n"
+            )
+
+        else:
+
+            result += (
+                f"🆔 ID не указан — "
+                f"👤 {person}\n"
+            )
+
+    await update.message.reply_text(
+        result
+    )
+
+
+# =========================================================
+# /DELETE — DELETE PLAYER BY PERMANENT ID
+# =========================================================
+
+async def delete_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user = update.effective_user
+
+    if not is_admin(user.id):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+
+    COMMAND_STATES[command_state_key(update)] = {
+        "command": "delete",
+        "step": "id"
+    }
+
+    await update.message.reply_text(
+        "🗑 Удаление человека\n\n"
+        "Введите ID игрока.\n\n"
+        "⚠️ Будут удалены игрок и ВСЕ его записи о цветах."
+    )
+
+
+# =========================================================
+# /AT — CREATE PLAYER
+# =========================================================
+
+async def at_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user = update.effective_user
+
+    if not is_admin(user.id):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+
+    # Новая команда всегда начинает собственный диалог.
+    COMMAND_STATES[command_state_key(update)] = {
+        "command": "at",
+        "step": "id"
+    }
+
+    await update.message.reply_text("Введите ID игрока:")
+
+
+# =========================================================
+# /ADD — ADD FLOWER TO EXISTING PLAYER
+# =========================================================
+
+async def add_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user = update.effective_user
+
+    if not is_admin(user.id):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+
+    key = command_state_key(update)
+    args = context.args or []
+
+    if args:
+        flower = normalize(" ".join(args))
         COMMAND_STATES[key] = {
-            "command": "add"
+            "command": "add",
+            "step": "id",
+            "flower": flower
         }
-
-        await query.message.reply_text(
-            "➕ Введи ID и ник через пробел.\n\n"
-            "Например:\n"
-            "`ABC123 Лекс`",
-            parse_mode="Markdown"
+        await update.message.reply_text(
+            f"🌸 Цветок: {flower}\n\nВведите ID игрока:"
         )
-
-        return
-
-    # -----------------------------------------------------
-    # PERSON FIND
-    # -----------------------------------------------------
-
-    if data == "person_find":
-
-        if not is_admin(user_id):
-            return
-
-        key = state_key(
-            user_id,
-            query.message.chat_id
-        )
-
+    else:
         COMMAND_STATES[key] = {
-            "command": "at"
+            "command": "add",
+            "step": "flower"
         }
+        await update.message.reply_text("Введите название цветка:")
 
-        await query.message.reply_text(
-            "🔎 Введи ID человека."
-        )
 
-        return
+# =========================================================
+# CANCEL COMMAND
+# =========================================================
 
-    # -----------------------------------------------------
-    # PERSON DELETE
-    # -----------------------------------------------------
+async def cancel_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    context.user_data.clear()
+    clear_command_state(update)
 
-    if data == "person_delete":
-
-        if not is_admin(user_id):
-            return
-
-        key = state_key(
-            user_id,
-            query.message.chat_id
-        )
-
-        COMMAND_STATES[key] = {
-            "command": "delete"
-        }
-
-        await query.message.reply_text(
-            "🗑 Введи ID человека, которого "
-            "нужно удалить."
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # BACK
-    # -----------------------------------------------------
-
-    if data == "admin_panel":
-
-        await query.message.reply_text(
-            "⚙️ Админ-панель",
-            reply_markup=admin_keyboard()
-        )
-
-        return
+    await update.message.reply_text(
+        "❌ Операция отменена."
+    )
 
 
 # =========================================================
@@ -1728,16 +2970,39 @@ telegram_app.add_handler(
     )
 )
 
+# Группа 0:
+# админские операции
 telegram_app.add_handler(
     MessageHandler(
         filters.TEXT & ~filters.COMMAND,
-        text_handler
-    )
+        admin_input
+    ),
+    group=0
+)
+
+# Группа 1:
+# реакция в группе
+telegram_app.add_handler(
+    MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        group_trigger
+    ),
+    group=1
+)
+
+# Группа 2:
+# обычный поиск в личке
+telegram_app.add_handler(
+    MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        search_flower
+    ),
+    group=2
 )
 
 
 # =========================================================
-# FLASK
+# RENDER HOME
 # =========================================================
 
 @app.route(
@@ -1745,68 +3010,70 @@ telegram_app.add_handler(
     methods=["GET"]
 )
 def home():
+    return "🌸 Лексовский Ботик-Мотик работает!"
 
-    return "Лексовский Ботик-Мотик работает!"
 
+# =========================================================
+# TELEGRAM WEBHOOK
+# =========================================================
 
-@app.route("/telegram/" + WEBHOOK_SECRET, methods=["POST"])
+@app.route(
+    "/telegram/" + WEBHOOK_SECRET,
+    methods=["POST"]
+)
 async def telegram_webhook():
+
+    data = request.get_json(
+        force=True
+    )
+
+    if not data:
+        return "OK"
+
+    update = Update.de_json(
+        data,
+        telegram_app.bot
+    )
+
+    await telegram_app.initialize()
+
     try:
-        data = request.get_json(force=True)
 
-        if not data:
-            return "OK", 200
+        if update.effective_user:
 
-        update = Update.de_json(
-            data,
-            telegram_app.bot
+            save_user(
+                update.effective_user,
+                update.effective_chat.id
+                if update.effective_chat
+                else None
+            )
+
+        await telegram_app.process_update(
+            update
         )
 
-        await telegram_app.initialize()
-
-        try:
-            if update.effective_user:
-                save_user(
-                    update.effective_user,
-                    update.effective_chat.id
-                    if update.effective_chat
-                    else None
-                )
-
-            await telegram_app.process_update(update)
-
-        finally:
-            await telegram_app.shutdown()
-
-        return "OK", 200
-
     except Exception as e:
-        print("WEBHOOK ERROR:", repr(e))
-        return "ERROR", 500
+
+        print(
+            "WEBHOOK ERROR:",
+            repr(e)
+        )
+
+    finally:
+
+        await telegram_app.shutdown()
+
+    return "OK"
 
 
 # =========================================================
 # STARTUP
 # =========================================================
 
+print("BOT: запуск приложения...")
+
 init_db()
+
 import_excel()
 
-
-# =========================================================
-# RUN
-# =========================================================
-
-if __name__ == "__main__":
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+print("BOT: приложение готово.")
