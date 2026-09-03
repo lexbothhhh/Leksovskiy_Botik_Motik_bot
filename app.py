@@ -2615,7 +2615,8 @@ async def search_flower(
                 """
                 SELECT f.flower_id, COALESCE(p.nickname, f.person)
                 FROM flowers f
-                LEFT JOIN players p ON p.player_id = f.flower_id
+                LEFT JOIN players p 
+                         ON p.player_id = f.flower_id
                 WHERE f.flower = %s
                 ORDER BY COALESCE(p.nickname, f.person)
                 """,
