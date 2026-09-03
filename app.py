@@ -893,7 +893,7 @@ async def start(
     context.user_data.clear()
 
     await update.message.reply_text(
-        "🌸 СКЛАД КУСТИКОВ\n\n"
+        " Лексовский Ботик-Мотик\n\n"
         "Напиши название цветка, чтобы узнать, "
         "у кого он есть.",
         reply_markup=main_keyboard(user.id)
@@ -3017,7 +3017,7 @@ telegram_app.add_handler(
     methods=["GET"]
 )
 def home():
-    return "🌸 СКЛАД КУСТИКОВ работает!"
+    return "Лексовский Ботик-Мотик работает!"
 
 
 # =========================================================
