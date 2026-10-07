@@ -31,7 +31,6 @@ ADMIN_IDS = {
     7256265881,
     557896074,
 }
-
 WEBHOOK_SECRET = "sklad-kustikov-2026-secret-8472"
 
 EXCEL_FILE = "flowers.xlsx"
