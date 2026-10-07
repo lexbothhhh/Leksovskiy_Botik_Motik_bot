@@ -1872,24 +1872,30 @@ async def admin_input(
             context.user_data.clear()
             return
 
-    # -----------------------------------------------------
+        # -----------------------------------------------------
     # DELETE ADMIN
     # -----------------------------------------------------
     if action == "admin_delete":
         if not is_owner(user.id):
             context.user_data.clear()
             return
+
         if step == "id":
             if not text.isdigit():
-                await update.message.reply_text("❌ ID должен состоять только из цифр.")
+                await update.message.reply_text(
+                    "❌ ID должен состоять только из цифр."
+                )
                 return
+
             telegram_id = int(text)
-           if telegram_id in ADMIN_IDS:
-    await update.message.reply_text(
-        "⛔ Главного администратора удалить нельзя."
-    )
-    context.user_data.clear()
-    return
+
+            if telegram_id in ADMIN_IDS:
+                await update.message.reply_text(
+                    "⛔ Главного администратора удалить нельзя."
+                )
+                context.user_data.clear()
+                return
+
             db = None
             try:
                 db = get_db()
@@ -1899,20 +1905,31 @@ async def admin_input(
                         (telegram_id,)
                     )
                     deleted = cursor.rowcount
+
                 db.commit()
+
                 if deleted:
                     log_action(user.id, "DELETE_ADMIN", str(telegram_id))
-                    await update.message.reply_text("✅ Администратор удалён.")
+                    await update.message.reply_text(
+                        "✅ Администратор удалён."
+                    )
                 else:
-                    await update.message.reply_text("❌ Такой администратор не найден.")
+                    await update.message.reply_text(
+                        "❌ Такой администратор не найден."
+                    )
+
             except Exception as e:
                 if db:
                     db.rollback()
                 print("DELETE ADMIN ERROR:", repr(e))
-                await update.message.reply_text("❌ Ошибка базы данных.")
+                await update.message.reply_text(
+                    "❌ Ошибка базы данных."
+                )
+
             finally:
                 if db:
                     db.close()
+
             context.user_data.clear()
             return
 
