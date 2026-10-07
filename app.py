@@ -26,8 +26,11 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-# ТВОЙ Telegram ID — главный администратор
-ADMIN_ID = 7256265881
+# ДВА ГЛАВНЫХ АДМИНИСТРАТОРА
+ADMIN_IDS = {
+    7256265881,
+    557896074,
+}
 
 WEBHOOK_SECRET = "sklad-kustikov-2026-secret-8472"
 
@@ -229,14 +232,15 @@ def init_db():
             """)
 
             # Главный админ
-            cursor.execute("""
-                INSERT INTO bot_admins
-                    (telegram_id, role)
-                VALUES
-                    (%s, 'owner')
-                ON CONFLICT (telegram_id)
-                DO UPDATE SET role = 'owner'
-            """, (ADMIN_ID,))
+            for admin_id in ADMIN_IDS:
+    cursor.execute("""
+        INSERT INTO bot_admins
+            (telegram_id, role)
+        VALUES
+            (%s, 'owner')
+        ON CONFLICT (telegram_id)
+        DO UPDATE SET role = 'owner'
+    """, (admin_id,))
 
             # Настройка триггеров группы
             cursor.execute("""
@@ -1881,10 +1885,12 @@ async def admin_input(
                 await update.message.reply_text("❌ ID должен состоять только из цифр.")
                 return
             telegram_id = int(text)
-            if telegram_id == ADMIN_ID:
-                await update.message.reply_text("⛔ Главного администратора удалить нельзя.")
-                context.user_data.clear()
-                return
+           if telegram_id in ADMIN_IDS:
+    await update.message.reply_text(
+        "⛔ Главного администратора удалить нельзя."
+    )
+    context.user_data.clear()
+    return
             db = None
             try:
                 db = get_db()
