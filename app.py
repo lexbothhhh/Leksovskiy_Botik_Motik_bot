@@ -1,3 +1,7 @@
+прпрпол
+пвапы
+шдра
+дшдшд
 import os
 import re
 import asyncio
