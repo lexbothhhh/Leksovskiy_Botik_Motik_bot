@@ -3053,47 +3053,6 @@ def telegram_webhook():
 
 async def telegram_webhook():
 
-    data = request.get_json(
-        force=True
-    )
-
-    if not data:
-        return "OK"
-
-    update = Update.de_json(
-        data,
-        telegram_app.bot
-    )
-
-    await telegram_app.initialize()
-
-    try:
-
-        if update.effective_user:
-
-            save_user(
-                update.effective_user,
-                update.effective_chat.id
-                if update.effective_chat
-                else None
-            )
-
-        await telegram_app.process_update(
-            update
-        )
-
-    except Exception as e:
-
-        print(
-            "WEBHOOK ERROR:",
-            repr(e)
-        )
-
-    finally:
-
-        await telegram_app.shutdown()
-
-    return "OK"
 
 
 # =========================================================
