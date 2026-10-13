@@ -2,7 +2,7 @@
 пвапы
 шдра
 дшдшд
-import os
+         import os
 import re
 import asyncio
 import psycopg2
