@@ -3048,6 +3048,9 @@ def home():
     "/telegram/" + WEBHOOK_SECRET,
     methods=["POST"]
 )
+def telegram_webhook():
+    return "OK"
+
 async def telegram_webhook():
 
     data = request.get_json(
