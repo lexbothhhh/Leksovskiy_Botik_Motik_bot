@@ -3065,4 +3065,7 @@ init_db()
 
 import_excel()
 
-print("BOT: приложение готово.")
+print("BOT: приложение готово."
+fvdfkllkxdhkfn
+cmbjcxbjcxhfbj
+kldfgkshdlgh
