@@ -3,3 +3,7 @@ gunicorn
 python-telegram-bot
 psycopg2-binary
 openpyxl
+python
+ggsdfg
+dsfb
+sdf
