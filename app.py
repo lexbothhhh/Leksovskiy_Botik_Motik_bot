@@ -3046,26 +3046,6 @@ def home():
 
 @app.route(
     "/telegram/" + WEBHOOK_SECRET,
-    methods=["POST"]
-)
-def telegram_webhook():
-    return "OK"
-
-async def telegram_webhook():
 
 
 
-# =========================================================
-# STARTUP
-# =========================================================
-
-print("BOT: запуск приложения...")
-
-init_db()
-
-import_excel()
-
-print("BOT: приложение готово."
-fvdfkllkxdhkfn
-cmbjcxbjcxhfbj
-kldfgkshdlgh
